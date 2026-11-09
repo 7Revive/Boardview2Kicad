@@ -1,3 +1,3 @@
-So i made this Boardview2Kicad extractor/converter, thusfar it can only do .FZ boardview files to kicad files, it extracts footprints, netlists, full pinouts, and also the entire pcb, but it doesnt include copper tracks as boardviews dont contain them.
+So i made this Boardview2Kicad extractor/converter, thusfar it can only do .FZ and .TVW boardviews, it extracts the footprints, PCB(with/without traces depending on boardview), netlists, etc...
 Build using "cargo build --release".
-To run it use "fz2kicad convert <path/to/boardview/boardview.fz> <output_directory>"
+To run it use "board2kicad <path/to/boardview/boardview.XXX> <output_directory>"
