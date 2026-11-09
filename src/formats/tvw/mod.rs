@@ -13,9 +13,10 @@ pub mod parts;
 pub mod testbuf;
 
 use std::collections::HashMap;
+use std::fmt;
 
-use crate::model::{Board, Part, Pin};
-use layers::{load_layer, Layer, LayerKind, LT_BOTTOM, LT_PLANE, LT_SIGNAL, LT_TOP};
+use crate::model::{Board, PadGeom, PadKind, Part, Pin};
+use layers::{load_layer, Layer, LayerKind, Shape, ShapeKind, LT_BOTTOM, LT_PLANE, LT_SIGNAL, LT_TOP};
 use parts::{read_nets, read_parts, scan_for_net_table, skip_probe_region, TvwPart, TvwPin};
 use reader::Reader;
 
@@ -91,6 +92,28 @@ pub fn is_tvw(data: &[u8]) -> bool {
 // Report
 // ---------------------------------------------------------------------------
 
+/// How many output pins got each kind of pad shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PadShapeCounts {
+    pub circle: usize,
+    pub rect: usize,
+    pub roundrect: usize,
+    /// Polygon shapes approximated by their bounding rectangle.
+    pub poly_rect: usize,
+    /// No usable shape (missing, unknown type or zero size): round fallback.
+    pub none: usize,
+}
+
+impl fmt::Display for PadShapeCounts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "pad shapes: circle {}, rect {}, roundrect {}, poly->rect {}, none {}",
+            self.circle, self.rect, self.roundrect, self.poly_rect, self.none
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Report {
     pub kind: String,
@@ -99,6 +122,7 @@ pub struct Report {
     pub layers: Vec<String>,
     pub nets: usize,
     pub tvw_parts: usize,
+    pub pad_shapes: PadShapeCounts,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,9 +173,9 @@ pub fn parse_with_report(data: &[u8]) -> Result<(Board, Report), String> {
                     l.layer_type,
                     l.kind,
                     l.shapes.len(),
-                    l.pads.len(),
-                    l.line_count,
-                    l.holes.len()
+                                           l.pads.len(),
+                                           l.line_count,
+                                           l.holes.len()
                 ));
                 layers.push(l);
             }
@@ -205,7 +229,8 @@ pub fn parse_with_report(data: &[u8]) -> Result<(Board, Report), String> {
     report.tvw_parts = tvw_parts.len();
 
     // CONVERT
-    let mut board = convert(&layers, &nets, &tvw_parts);
+    let (mut board, pad_shapes) = convert(&layers, &nets, &tvw_parts);
+    report.pad_shapes = pad_shapes;
     warnings.append(&mut board.warnings);
     board.warnings = warnings;
 
@@ -259,6 +284,7 @@ struct Counters {
     pins_without_pad: usize,
     pads_without_shape: usize,
     parts_without_pins: usize,
+    pad_shapes: PadShapeCounts,
 }
 
 /// Hands out unique refdes names: C1, then C1_2, C1_3, ...
@@ -300,28 +326,86 @@ fn is_copper(layer: &Layer) -> bool {
     && matches!(layer.layer_type, LT_TOP | LT_BOTTOM | LT_SIGNAL | LT_PLANE)
 }
 
+/// Real pad geometry from a TVW aperture shape (normalized), counting the result.
+fn pad_from_shape(shape: Option<&Shape>, counts: &mut PadShapeCounts) -> Option<PadGeom> {
+    let geom = shape.and_then(|s| {
+        if s.width <= 0.0 || s.height <= 0.0 {
+            return None;
+        }
+        let rect = |kind: PadKind, w: f64, h: f64| PadGeom {
+            kind,
+            w,
+            h,
+            angle: s.turn,
+        };
+        match s.kind {
+            ShapeKind::Round => {
+                counts.circle += 1;
+                Some(PadGeom::circle(s.width.max(s.height)))
+            }
+            ShapeKind::Rect => {
+                counts.rect += 1;
+                Some(rect(PadKind::Rect, s.width, s.height))
+            }
+            ShapeKind::RoundRect => {
+                counts.roundrect += 1;
+                Some(rect(PadKind::RoundRect, s.width, s.height))
+            }
+            ShapeKind::Poly => {
+                counts.poly_rect += 1;
+                let (w, h) = match s.polygon.as_ref().filter(|p| p.len() >= 3) {
+                    Some(pts) => {
+                        let min_x = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+                        let max_x = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+                        let min_y = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+                        let max_y = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+                        (max_x - min_x, max_y - min_y)
+                    }
+                    None => (s.width, s.height),
+                };
+                if w > 0.0 && h > 0.0 {
+                    Some(rect(PadKind::Rect, w, h))
+                } else {
+                    counts.poly_rect -= 1;
+                    None
+                }
+            }
+            ShapeKind::Other(_) => None,
+        }
+    });
+    match geom {
+        Some(g) => Some(g.normalized()),
+        None => {
+            counts.none += 1;
+            None
+        }
+    }
+}
+
 fn resolve_pins(pins: &[TvwPin], layer: &Layer, nets: &[String], c: &mut Counters) -> Vec<Pin> {
     let mut out = Vec::with_capacity(pins.len());
     for pin in pins {
         let pad = match layer.pads.get((pin.handle / 8) as usize) {
             Some(p) => p,
-                          None => {
-                              c.pins_without_pad += 1;
-                              continue;
-                          }
+            None => {
+                c.pins_without_pad += 1;
+                continue;
+            }
         };
         let net = if pad.net >= 0 && (pad.net as usize) < nets.len() {
             nets[pad.net as usize].clone()
         } else {
             String::new()
         };
-        let radius = match layer.shape_for(pad.dcode) {
+        let shape = layer.shape_for(pad.dcode);
+        let radius = match shape {
             Some(s) => s.width.max(s.height) / 2.0,
-                          None => {
-                              c.pads_without_shape += 1;
-                              10.0
-                          }
+            None => {
+                c.pads_without_shape += 1;
+                10.0
+            }
         };
+        let geom = pad_from_shape(shape, &mut c.pad_shapes);
         out.push(Pin {
             number: pin.id.to_string(),
                  name: pin.name.clone(),
@@ -329,6 +413,7 @@ fn resolve_pins(pins: &[TvwPin], layer: &Layer, nets: &[String], c: &mut Counter
                  x: pad.x,
                  y: pad.y,
                  radius,
+                 pad: geom,
         });
     }
     out
@@ -339,24 +424,24 @@ fn make_part(refdes: String, tp: &TvwPart, bottom: bool, pins: Vec<Pin>) -> Part
     Part {
         refdes,
         insertion_code: "1".to_string(),
-                          sym_name: tp.package.clone(),
-                          bottom,
-                          rotation: Some(tp.angle as f64),
-                          part_number: if tp.serial.is_empty() {
-                              None
-                          } else {
-                              Some(tp.serial.clone())
-                          },
-                          description: if description.is_empty() {
-                              None
-                          } else {
-                              Some(description)
-                          },
-                          pins,
+        sym_name: tp.package.clone(),
+        bottom,
+        rotation: Some(tp.angle as f64),
+        part_number: if tp.serial.is_empty() {
+            None
+        } else {
+            Some(tp.serial.clone())
+        },
+        description: if description.is_empty() {
+            None
+        } else {
+            Some(description)
+        },
+        pins,
     }
 }
 
-fn convert(layers: &[Layer], nets: &[String], tvw_parts: &[TvwPart]) -> Board {
+fn convert(layers: &[Layer], nets: &[String], tvw_parts: &[TvwPart]) -> (Board, PadShapeCounts) {
     let mut board = Board::default();
     let mut c = Counters::default();
     let mut namer = Namer::default();
@@ -364,10 +449,10 @@ fn convert(layers: &[Layer], nets: &[String], tvw_parts: &[TvwPart]) -> Board {
     for tp in tvw_parts {
         let layer = match layers.get(tp.layer as usize) {
             Some(l) if is_copper(l) => l,
-                          _ => {
-                              c.non_copper += 1;
-                              continue;
-                          }
+            _ => {
+                c.non_copper += 1;
+                continue;
+            }
         };
         let bottom = layer.layer_type == LT_BOTTOM;
         let mut produced = false;
@@ -425,12 +510,13 @@ fn convert(layers: &[Layer], nets: &[String], tvw_parts: &[TvwPart]) -> Board {
                        namer.renamed, from, to
         ));
     }
-    board
+    (board, c.pad_shapes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use layers::Pad;
     use testbuf::Buf;
 
     fn write_header(b: &mut Buf, layer_count: u32) {
@@ -542,6 +628,8 @@ mod tests {
         assert_eq!(c1.pins[0].x, 100.0);
         assert_eq!(c1.pins[1].x, 140.0);
         assert_eq!(c1.pins[0].radius, 10.0);
+        assert_eq!(c1.pins[0].pad, Some(PadGeom::circle(20.0)));
+        assert_eq!(c1.pins[1].pad, Some(PadGeom::circle(20.0)));
         assert_eq!(c1.sym_name, "0402");
         assert_eq!(c1.description.as_deref(), Some("10k 0402"));
 
@@ -550,10 +638,81 @@ mod tests {
         assert_eq!(u1.pins[0].x, 500.0);
         assert_eq!(u1.pins[0].net, "GND");
 
+        // C1 (2) + C1_2 (2) + U1 (1) pins, all Round.
+        assert_eq!(report.pad_shapes.circle, 5);
+        assert_eq!(report.pad_shapes.none, 0);
+
         assert!(
             board.warnings.iter().any(|w| w.contains("duplicate")),
                 "{:?}",
                 board.warnings
+        );
+    }
+
+    #[test]
+    fn rect_shape_becomes_normalized_rect_pad() {
+        let layer = Layer {
+            kind: LayerKind::Logic,
+            name: "TOP".to_string(),
+            layer_type: LT_TOP,
+            shapes: vec![Shape {
+                kind: ShapeKind::Rect,
+                width: 30.0,
+                height: 10.0,
+                turn: 90.0,
+                polygon: None,
+            }],
+            pads: vec![Pad {
+                net: 0,
+                dcode: 10,
+                x: 1.0,
+                y: 2.0,
+                is_exposed: false,
+                is_copper: true,
+            }],
+            line_count: 0,
+            arc_count: 0,
+            surface_count: 0,
+            tool_sizes: Vec::new(),
+            holes: Vec::new(),
+        };
+        let part = TvwPart {
+            name: "R1".to_string(),
+            bbox_min: (0.0, 0.0),
+            bbox_max: (0.0, 0.0),
+            x: 0.0,
+            y: 0.0,
+            angle: 0,
+            part_type: 1,
+            layer: 0,
+            value: String::new(),
+            package: String::new(),
+            serial: String::new(),
+            height: 0.0,
+            pins: vec![TvwPin {
+                handle: 0,
+                id: 1,
+                name: "1".to_string(),
+            }],
+            pins_ext: None,
+        };
+
+        let (board, counts) = convert(&[layer], &["GND".to_string()], &[part]);
+        let pin = &board.parts[0].pins[0];
+        assert_eq!(
+            pin.pad,
+            Some(PadGeom {
+                kind: PadKind::Rect,
+                w: 10.0,
+                h: 30.0,
+                angle: 0.0,
+            })
+        );
+        assert_eq!(pin.radius, 15.0);
+        assert_eq!(counts.rect, 1);
+        assert_eq!(
+            counts.to_string(),
+                   "pad shapes: circle 0, rect 1, roundrect 0, poly->rect 0, none 0"
         );
     }
 
@@ -570,10 +729,10 @@ mod tests {
     fn real_file() {
         let path = match std::env::var("TVW_SAMPLE") {
             Ok(p) => p,
-                          Err(_) => {
-                              eprintln!("note: set TVW_SAMPLE to a .tvw file to run this test");
-                              return;
-                          }
+            Err(_) => {
+                eprintln!("note: set TVW_SAMPLE to a .tvw file to run this test");
+                return;
+            }
         };
         let data = std::fs::read(&path).expect("read TVW_SAMPLE");
         let (board, report) = parse_with_report(&data).expect("parse");
@@ -586,6 +745,7 @@ mod tests {
         }
         println!("nets:      {}", report.nets);
         println!("tvw parts: {}", report.tvw_parts);
+        println!("{}", report.pad_shapes);
 
         println!("board parts:   {}", board.parts.len());
         println!("total pins:    {}", board.pin_count());

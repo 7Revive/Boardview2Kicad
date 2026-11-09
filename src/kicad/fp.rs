@@ -171,9 +171,10 @@ mod tests {
     fn pad(number: &str, x: f64, y: f64, radius: f64) -> Pad {
         Pad {
             number: number.to_string(),
-                                                                                       x,
-                                                                                       y,
-                                                                                       radius,
+            x,
+            y,
+            radius,
+            geom: None,
         }
     }
 

@@ -10,7 +10,7 @@ pub mod lexer;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{Board, Part, Pin};
+use crate::model::{Board, PadGeom, PadKind, Part, Pin};
 use lexer::{num, section, sections, to_text, Line, Section};
 
 // ---------------------------------------------------------------------------
@@ -33,6 +33,11 @@ fn arg_upper(line: &Line, i: usize) -> String {
     .get(i)
     .map(|s| s.to_uppercase())
     .unwrap_or_default()
+}
+
+/// True if argument `i` is MIRRORX or MIRRORY.
+fn arg_is_mirror(line: &Line, i: usize) -> bool {
+    matches!(arg_upper(line, i).as_str(), "MIRRORX" | "MIRRORY")
 }
 
 /// Grows an optional bounding box (min_x, min_y, max_x, max_y) by a point.
@@ -99,11 +104,30 @@ fn units_factor(all: &[Section], warnings: &mut Vec<String>) -> f64 {
 
 struct PadAcc {
     name: String,
+    /// Pad type, the 2nd token of the PAD line, uppercased (e.g. FINGER).
+    kind: String,
     circle: f64,
+    /// Box from RECTANGLE, LINE and ARC records together (used for the radius).
     bbox: Option<(f64, f64, f64, f64)>,
+    /// First RECTANGLE record's |w|, |h|.
+    rect: Option<(f64, f64)>,
+    /// Box from LINE and ARC end points only (used for the shape).
+    outline: Option<(f64, f64, f64, f64)>,
 }
 
-fn finish_pad(acc: PadAcc, f: f64, out: &mut HashMap<String, f64>) {
+/// Pad tables built from $PADS, all sizes in mils.
+#[derive(Default)]
+struct Pads {
+    radius: HashMap<String, f64>,
+    geom: HashMap<String, PadGeom>,
+}
+
+fn finish_pad(acc: PadAcc, f: f64, out: &mut Pads) {
+    if acc.name.is_empty() {
+        return;
+    }
+
+    // Radius: unchanged rule.
     let radius = if acc.circle > 0.0 {
         acc.circle
     } else {
@@ -112,14 +136,43 @@ fn finish_pad(acc: PadAcc, f: f64, out: &mut HashMap<String, f64>) {
         .unwrap_or(0.0)
     };
     let r = radius * f;
-    if r > 0.0 && !acc.name.is_empty() {
-        out.insert(acc.name, r);
+    if r > 0.0 {
+        out.radius.insert(acc.name.clone(), r);
+    }
+
+    // Shape: circle, else rectangle, else outline box.
+    let geom = if acc.circle > 0.0 {
+        Some(PadGeom::circle(2.0 * acc.circle * f))
+    } else if let Some((w, h)) = acc.rect {
+        Some(PadGeom {
+            kind: PadKind::Rect,
+            w: w * f,
+            h: h * f,
+            angle: 0.0,
+        })
+    } else if let Some((x0, y0, x1, y1)) = acc.outline {
+        let kind = if acc.kind == "FINGER" || acc.kind == "BULLET" {
+            PadKind::Oval
+        } else {
+            PadKind::Rect
+        };
+        Some(PadGeom {
+            kind,
+            w: (x1 - x0) * f,
+             h: (y1 - y0) * f,
+             angle: 0.0,
+        })
+    } else {
+        None
+    };
+    if let Some(g) = geom.filter(|g| g.w > 0.0 && g.h > 0.0) {
+        out.geom.insert(acc.name, g);
     }
 }
 
-/// Pad name -> radius in mils.
-fn read_pads(all: &[Section], f: f64) -> HashMap<String, f64> {
-    let mut out = HashMap::new();
+/// Pad name -> radius and shape, in mils.
+fn read_pads(all: &[Section], f: f64) -> Pads {
+    let mut out = Pads::default();
     let Some(sec) = section(all, "PADS") else {
         return out;
     };
@@ -133,14 +186,20 @@ fn read_pads(all: &[Section], f: f64) -> HashMap<String, f64> {
                 }
                 cur = Some(PadAcc {
                     name: line.args.first().cloned().unwrap_or_default(),
+                           kind: arg_upper(line, 1),
                            circle: 0.0,
                            bbox: None,
+                           rect: None,
+                           outline: None,
                 });
             }
             "RECTANGLE" => {
                 if let (Some(acc), Some(w), Some(h)) = (cur.as_mut(), arg(line, 2), arg(line, 3)) {
                     grow(&mut acc.bbox, 0.0, 0.0);
                     grow(&mut acc.bbox, w.abs(), h.abs());
+                    if acc.rect.is_none() {
+                        acc.rect = Some((w.abs(), h.abs()));
+                    }
                 }
             }
             "CIRCLE" => {
@@ -158,6 +217,8 @@ fn read_pads(all: &[Section], f: f64) -> HashMap<String, f64> {
                 ) {
                     grow(&mut acc.bbox, x1, y1);
                     grow(&mut acc.bbox, x2, y2);
+                    grow(&mut acc.outline, x1, y1);
+                    grow(&mut acc.outline, x2, y2);
                 }
             }
             _ => {}
@@ -173,12 +234,21 @@ fn read_pads(all: &[Section], f: f64) -> HashMap<String, f64> {
 // 3. Padstacks
 // ---------------------------------------------------------------------------
 
-/// Padstack name -> radius in mils (smallest outer-layer pad, else smallest other).
-fn read_padstacks(all: &[Section], pads: &HashMap<String, f64>) -> HashMap<String, f64> {
-    let mut outer: HashMap<String, f64> = HashMap::new();
-    let mut other: HashMap<String, f64> = HashMap::new();
+/// Padstack tables, all sizes in mils.
+#[derive(Default)]
+struct Stacks {
+    radius: HashMap<String, f64>,
+    geom: HashMap<String, PadGeom>,
+}
+
+/// Smallest outer-layer pad per padstack, else smallest other-layer pad.
+/// The chosen pad's shape is mirrored/rotated as given on its PAD line.
+fn read_padstacks(all: &[Section], pads: &Pads) -> Stacks {
+    let mut outer: HashMap<String, (f64, Option<PadGeom>)> = HashMap::new();
+    let mut other: HashMap<String, (f64, Option<PadGeom>)> = HashMap::new();
+    let mut out = Stacks::default();
     let Some(sec) = section(all, "PADSTACKS") else {
-        return outer;
+        return out;
     };
     let mut cur: Option<String> = None;
 
@@ -192,15 +262,22 @@ fn read_padstacks(all: &[Section], pads: &HashMap<String, f64>) -> HashMap<Strin
                 if layer.contains("MASK") || layer.contains("PASTE") || layer.contains("GLUE") {
                     continue;
                 }
-                let Some(&r) = pads.get(pad_name) else { continue };
+                let Some(&r) = pads.radius.get(pad_name) else { continue };
+
+                // Mirror first, then rotate.
+                let geom = pads.geom.get(pad_name).map(|&g| {
+                    let g = if arg_is_mirror(line, 3) { g.mirrored_x() } else { g };
+                    g.rotated(arg(line, 2).unwrap_or(0.0))
+                });
+
                 let target = if matches!(layer.as_str(), "TOP" | "BOTTOM" | "ALL") {
                     &mut outer
                 } else {
                     &mut other
                 };
-                let e = target.entry(stack.clone()).or_insert(r);
-                if r < *e {
-                    *e = r;
+                let e = target.entry(stack.clone()).or_insert((r, geom));
+                if r < e.0 {
+                    *e = (r, geom);
                 }
             }
             _ => {}
@@ -210,7 +287,13 @@ fn read_padstacks(all: &[Section], pads: &HashMap<String, f64>) -> HashMap<Strin
     for (k, v) in other {
         outer.entry(k).or_insert(v);
     }
-    outer
+    for (k, (r, g)) in outer {
+        if let Some(g) = g {
+            out.geom.insert(k.clone(), g);
+        }
+        out.radius.insert(k, r);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +306,10 @@ struct ShapePin {
     padstack: String,
     x: f64,
     y: f64,
+    /// Pad rotation in degrees (PIN line, after side).
+    rot: f64,
+    /// Pad mirrored (MIRRORX or MIRRORY on the PIN line).
+    mirror: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -263,6 +350,8 @@ fn read_shapes(all: &[Section], f: f64) -> HashMap<String, Shape> {
                                     padstack: line.args[1].clone(),
                                     x: x * f,
                                     y: y * f,
+                                    rot: arg(line, 5).unwrap_or(0.0),
+                                    mirror: arg_is_mirror(line, 6),
                         });
                     }
             }
@@ -815,10 +904,24 @@ pub fn parse(data: &[u8]) -> Result<Board, String> {
             .cloned()
             .unwrap_or_default();
             let radius = stacks
+            .radius
             .get(&sp.padstack)
-            .or_else(|| pads.get(&sp.padstack))
+            .or_else(|| pads.radius.get(&sp.padstack))
             .copied()
             .unwrap_or(6.0);
+
+            // Pad shape: pin mirror, pin rotation, component mirror, component rotation.
+            let pad = stacks
+            .geom
+            .get(&sp.padstack)
+            .or_else(|| pads.geom.get(&sp.padstack))
+            .map(|&g| {
+                let g = if sp.mirror { g.mirrored_x() } else { g };
+                let g = g.rotated(sp.rot);
+                let g = if c.mirror != Mirror::None { g.mirrored_x() } else { g };
+                g.rotated(c.rot)
+            });
+
             Pin {
                 number: sp.name.clone(),
              name: sp.name.clone(),
@@ -826,6 +929,7 @@ pub fn parse(data: &[u8]) -> Result<Board, String> {
              x: rx + c.x,
              y: ry + c.y,
              radius,
+             pad,
             }
         })
         .collect();
@@ -885,6 +989,30 @@ mod tests {
     /// Two-pin shape S2: pins "1" at (-10, 0) and "2" at (10, 0), padstack PS.
     const SHAPE_S2: &str = "$SHAPES\nSHAPE S2\nPIN 1 PS -10 0 TOP 0 0\nPIN 2 PS 10 0 TOP 0 0\n$ENDSHAPES\n";
 
+    /// One-pin board: pad P1 (defined by `pad_records`), padstack PS = P1 on TOP,
+    /// shape S with pin "1" at (0, 0) with the given pin rotation/mirror, and
+    /// component U1 at (0, 0) with the extra `comp_lines`.
+    fn one_pin_board(pad_type: &str, pad_records: &str, pin_rot: f64, comp_lines: &str) -> Board {
+        let text = file(
+            "THOU",
+            &format!(
+                "$PADS\nPAD P1 {} 0\n{}$ENDPADS\n\
+$PADSTACKS\nPADSTACK PS 0\nPAD P1 TOP 0 0\n$ENDPADSTACKS\n\
+$SHAPES\nSHAPE S\nPIN 1 PS 0 0 TOP {} 0\n$ENDSHAPES\n\
+$COMPONENTS\nCOMPONENT U1\nPLACE 0 0\n{}$ENDCOMPONENTS\n",
+pad_type, pad_records, pin_rot, comp_lines
+            ),
+        );
+        parse(text.as_bytes()).unwrap()
+    }
+
+    fn assert_pad(pin: &Pin, kind: PadKind, w: f64, h: f64, angle: f64) {
+        let g = pin.pad.expect("pin has a pad shape");
+        assert_eq!(g.kind, kind, "{:?}", g);
+        assert!(close(g.w, w) && close(g.h, h), "{:?}", g);
+        assert!(close(g.angle, angle), "{:?}", g);
+    }
+
     #[test]
     fn detects_gencad() {
         assert!(is_gencad(b"$HEADER\nGENCAD 1.4\nUNITS INCH\n$ENDHEADER\n"));
@@ -907,6 +1035,7 @@ $COMPONENTS\nCOMPONENT R1\nPLACE 1 2\nLAYER TOP\nROTATION 0\nSHAPE S2 0 0\n$ENDC
         assert!(close(p.pins[0].x, 990.0) && close(p.pins[0].y, 2000.0));
         assert!(close(p.pins[1].x, 1010.0) && close(p.pins[1].y, 2000.0));
         assert_eq!(p.pins[0].radius, 6.0);
+        assert!(p.pins[0].pad.is_none());
     }
 
     #[test]
@@ -945,6 +1074,8 @@ $COMPONENTS\nCOMPONENT C1\nPLACE 0 0\nSHAPE SH\n$ENDCOMPONENTS\n",
         let p = &board.parts[0];
         assert!(close(p.pins[0].radius, 10.0), "{}", p.pins[0].radius);
         assert!(close(p.pins[1].radius, 8.0), "{}", p.pins[1].radius);
+        // The mask-layer pad PM is ignored for the shape too.
+        assert_pad(&p.pins[0], PadKind::Rect, 20.0, 30.0, 0.0);
     }
 
     #[test]
@@ -1037,6 +1168,52 @@ $COMPONENTS\nCOMPONENT U1\nPLACE 0 0\nSHAPE D\n$ENDCOMPONENTS\n",
         }
     }
 
+    #[test]
+    fn rect_pad_turned_by_component_rotation() {
+        let board = one_pin_board("RECTANGULAR", "RECTANGLE 0 0 20 30\n", 0.0, "ROTATION 90\nSHAPE S\n");
+        assert_pad(&board.parts[0].pins[0], PadKind::Rect, 30.0, 20.0, 0.0);
+    }
+
+    #[test]
+    fn rect_pad_turned_by_pin_rotation() {
+        let board = one_pin_board("RECTANGULAR", "RECTANGLE 0 0 20 30\n", 45.0, "ROTATION 0\nSHAPE S\n");
+        assert_pad(&board.parts[0].pins[0], PadKind::Rect, 20.0, 30.0, 45.0);
+    }
+
+    #[test]
+    fn rect_pad_on_mirrored_bottom_component() {
+        let board = one_pin_board(
+            "RECTANGULAR",
+            "RECTANGLE 0 0 20 30\n",
+            30.0,
+            "LAYER BOTTOM\nSHAPE S MIRRORY\n",
+        );
+        let part = &board.parts[0];
+        assert!(part.bottom);
+        assert_pad(&part.pins[0], PadKind::Rect, 20.0, 30.0, 150.0);
+    }
+
+    #[test]
+    fn circle_pad() {
+        let board = one_pin_board("ROUND", "CIRCLE 0 0 8\n", 0.0, "SHAPE S\n");
+        let pin = &board.parts[0].pins[0];
+        assert_eq!(pin.pad, Some(PadGeom::circle(16.0)));
+        assert!(close(pin.radius, 8.0));
+    }
+
+    #[test]
+    fn finger_pad_from_lines_is_oval() {
+        let board = one_pin_board(
+            "FINGER",
+            "LINE 0 0 10 0\nLINE 10 0 10 40\nLINE 10 40 0 40\nLINE 0 40 0 0\n",
+            0.0,
+            "SHAPE S\n",
+        );
+        let pin = &board.parts[0].pins[0];
+        assert_pad(pin, PadKind::Oval, 10.0, 40.0, 0.0);
+        assert!(close(pin.radius, 5.0));
+    }
+
     /// Run with: GENCAD_SAMPLE=path/to/file.cad cargo test gencad::tests::real_file -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -1054,11 +1231,27 @@ $COMPONENTS\nCOMPONENT U1\nPLACE 0 0\nSHAPE D\n$ENDCOMPONENTS\n",
 
         let top = board.parts.iter().filter(|p| !p.bottom).count();
         let bottom = board.parts.len() - top;
+
+        let (mut circle, mut rect, mut roundrect, mut oval, mut none) = (0, 0, 0, 0, 0);
+        for pin in board.parts.iter().flat_map(|p| p.pins.iter()) {
+            match pin.pad.map(|g| g.kind) {
+                Some(PadKind::Circle) => circle += 1,
+                Some(PadKind::Rect) => rect += 1,
+                Some(PadKind::RoundRect) => roundrect += 1,
+                Some(PadKind::Oval) => oval += 1,
+                None => none += 1,
+            }
+        }
+
         println!("units factor:  {} mils per file unit", factor);
         println!("parts:         {}", board.parts.len());
         println!("total pins:    {}", board.pin_count());
         println!("distinct nets: {}", board.net_names().len());
         println!("top / bottom:  {} / {}", top, bottom);
+        println!(
+            "pad shapes: circle {}, rect {}, roundrect {}, oval {}, none {}",
+            circle, rect, roundrect, oval, none
+        );
         println!("warnings ({}):", board.warnings.len());
         for w in &board.warnings {
             println!("  {}", w);

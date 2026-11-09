@@ -13,6 +13,101 @@ use std::collections::BTreeSet;
 /// One mil in millimetres (1 mil = 0.001 inch = 0.0254 mm).
 pub const MIL_TO_MM: f64 = 0.0254;
 
+/// The outline of a pad.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PadKind {
+    Circle,
+    Rect,
+    RoundRect,
+    Oval,
+}
+
+/// Pad geometry in MILS. `angle` is the pad's rotation in degrees,
+/// counter-clockwise, in the same frame as the pin coordinates (board
+/// frame, Y up).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PadGeom {
+    pub kind: PadKind,
+    pub w: f64,
+    pub h: f64,
+    pub angle: f64,
+}
+
+impl PadGeom {
+    /// A round pad of the given diameter.
+    pub fn circle(diameter: f64) -> Self {
+        PadGeom {
+            kind: PadKind::Circle,
+            w: diameter,
+            h: diameter,
+            angle: 0.0,
+        }
+    }
+
+    /// Same pad, described in a standard way so equal pads compare equal:
+    /// - Circle: w = h = max(w, h), angle 0
+    /// - others: angle reduced into [0, 180) (all four kinds look the same
+    ///   after a 180 degree turn); if the angle is within 0.01 of 90, swap
+    ///   w and h and set angle 0; if within 0.01 of 0 or 180 -> 0;
+    ///   a Rect/RoundRect/Oval with w == h (within 0.001) and an angle that
+    ///   is a multiple of 90 -> angle 0.
+    pub fn normalized(self) -> Self {
+        const ANGLE_TOL: f64 = 0.01;
+        const SIZE_TOL: f64 = 0.001;
+
+        if self.kind == PadKind::Circle {
+            let d = self.w.max(self.h);
+            return PadGeom::circle(d);
+        }
+
+        let mut w = self.w;
+        let mut h = self.h;
+        let mut a = self.angle.rem_euclid(180.0);
+
+        if (a - 90.0).abs() <= ANGLE_TOL {
+            std::mem::swap(&mut w, &mut h);
+            a = 0.0;
+        } else if a <= ANGLE_TOL || a >= 180.0 - ANGLE_TOL {
+            // Also catches rem_euclid returning 180.0 for tiny negative angles.
+            a = 0.0;
+        }
+
+        // A square looks the same at every multiple of 90 degrees. (After
+        // the steps above such angles are already 0; kept for clarity.)
+        if (w - h).abs() <= SIZE_TOL {
+            let q = a / 90.0;
+            if (q - q.round()).abs() * 90.0 <= ANGLE_TOL {
+                a = 0.0;
+            }
+        }
+
+        PadGeom {
+            kind: self.kind,
+            w,
+            h,
+            angle: a,
+        }
+    }
+
+    /// Rotated by `deg` (counter-clockwise), then normalized.
+    pub fn rotated(self, deg: f64) -> Self {
+        PadGeom {
+            angle: self.angle + deg,
+            ..self
+        }
+        .normalized()
+    }
+
+    /// Mirrored left-right (x -> -x): angle -> -angle, then normalized.
+    pub fn mirrored_x(self) -> Self {
+        PadGeom {
+            angle: -self.angle,
+            ..self
+        }
+        .normalized()
+    }
+}
+
 /// One pin (pad) of a part.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pin {
@@ -28,6 +123,16 @@ pub struct Pin {
     pub y: f64,
     /// Half the pad size, mils.
     pub radius: f64,
+    /// Real pad shape, if the source format has one.
+    /// None = round pad of diameter 2 * radius.
+    pub pad: Option<PadGeom>,
+}
+
+impl Pin {
+    /// The pad shape to draw: `pad` if known, else a circle of diameter 2 * radius.
+    pub fn pad_geom(&self) -> PadGeom {
+        self.pad.unwrap_or_else(|| PadGeom::circle(2.0 * self.radius))
+    }
 }
 
 /// One component on the board.
@@ -99,6 +204,7 @@ mod tests {
             x: 0.0,
             y: 0.0,
             radius: 5.0,
+            pad: None,
         }
     }
 
@@ -127,6 +233,15 @@ mod tests {
         }
     }
 
+    fn rect(w: f64, h: f64, angle: f64) -> PadGeom {
+        PadGeom {
+            kind: PadKind::Rect,
+            w,
+            h,
+            angle,
+        }
+    }
+
     #[test]
     fn net_names_are_unique_sorted_and_skip_empty() {
         assert_eq!(sample_board().net_names(), vec!["GND", "VCC"]);
@@ -142,5 +257,58 @@ mod tests {
         let board = sample_board();
         assert_eq!(board.part("C1").map(|p| p.refdes.as_str()), Some("C1"));
         assert!(board.part("X").is_none());
+    }
+
+    #[test]
+    fn rect_at_90_swaps_sides() {
+        assert_eq!(rect(20.0, 10.0, 90.0).normalized(), rect(10.0, 20.0, 0.0));
+    }
+
+    #[test]
+    fn rect_at_270_and_180() {
+        assert_eq!(rect(20.0, 10.0, 270.0).normalized(), rect(10.0, 20.0, 0.0));
+        assert_eq!(rect(20.0, 10.0, 180.0).normalized(), rect(20.0, 10.0, 0.0));
+        assert_eq!(rect(20.0, 10.0, -90.0).normalized(), rect(10.0, 20.0, 0.0));
+        assert_eq!(rect(20.0, 10.0, 90.005).normalized(), rect(10.0, 20.0, 0.0));
+    }
+
+    #[test]
+    fn mirrored_x_negates_angle() {
+        let m = rect(20.0, 10.0, 30.0).mirrored_x();
+        assert_eq!((m.w, m.h), (20.0, 10.0));
+        assert!((m.angle - 150.0).abs() < 1e-9, "{}", m.angle);
+    }
+
+    #[test]
+    fn circle_ignores_angle() {
+        let c = PadGeom::circle(12.0);
+        assert_eq!((c.kind, c.w, c.h, c.angle), (PadKind::Circle, 12.0, 12.0, 0.0));
+
+        let tilted = PadGeom {
+            kind: PadKind::Circle,
+            w: 12.0,
+            h: 10.0,
+            angle: 45.0,
+        };
+        assert_eq!(tilted.normalized(), PadGeom::circle(12.0));
+    }
+
+    #[test]
+    fn rotated_by_90() {
+        assert_eq!(rect(20.0, 10.0, 0.0).rotated(90.0), rect(10.0, 20.0, 0.0));
+    }
+
+    #[test]
+    fn square_and_odd_angles() {
+        // A square at a multiple of 90 is angle 0.
+        assert_eq!(rect(15.0, 15.0, 270.0).normalized(), rect(15.0, 15.0, 0.0));
+        // A non-right angle is kept.
+        assert_eq!(rect(20.0, 10.0, 45.0).normalized(), rect(20.0, 10.0, 45.0));
+    }
+
+    #[test]
+    fn pad_geom_falls_back_to_circle() {
+        let p = pin("1", "");
+        assert_eq!(p.pad_geom(), PadGeom::circle(10.0));
     }
 }

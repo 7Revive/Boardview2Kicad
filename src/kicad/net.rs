@@ -160,6 +160,7 @@ mod tests {
             x,
             y,
             radius: 5.0,
+            pad: None,
                 })
             .collect(),
         }

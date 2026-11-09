@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::model::{Board, Part};
+use crate::model::{Board, PadGeom, PadKind, Part};
 
 /// One pad of a footprint, in footprint-local coordinates (mils, top view).
 #[derive(Debug, Clone)]
@@ -12,6 +12,9 @@ pub struct Pad {
     pub y: f64,
     /// Half the pad size, mils.
     pub radius: f64,
+    /// Real pad shape in footprint-local orientation (top view), if known.
+    /// None = round pad of diameter 2 * radius.
+    pub geom: Option<PadGeom>,
 }
 
 /// One distinct pad layout.
@@ -59,8 +62,12 @@ pub struct Library {
     pub skipped: Vec<String>,
 }
 
-/// The identity of a pad layout: (number, x, y, radius), in 0.1-mil steps, sorted.
-type Key = Vec<(String, i64, i64, i64)>;
+/// One pad in a key: (number, x, y, radius) in 0.1-mil steps, then the
+/// geometry tag (kind, w, h, angle) - see `geom_tag`.
+type KeyEntry = (String, i64, i64, i64, i64, i64, i64, i64);
+
+/// The identity of a pad layout: one entry per pad, sorted.
+type Key = Vec<KeyEntry>;
 
 /// One rotation of one part, ready to compare with the others.
 struct Candidate {
@@ -72,6 +79,23 @@ struct Candidate {
 /// Round to 0.1-mil steps, so tiny floating-point differences don't matter.
 fn q(v: f64) -> i64 {
     (v * 10.0).round() as i64
+}
+
+/// Pad geometry as key fields: None -> (0, 0, 0, 0);
+/// Some -> (kind 1..4, w in 0.1 mil, h in 0.1 mil, angle in 0.01 degree).
+fn geom_tag(geom: Option<PadGeom>) -> (i64, i64, i64, i64) {
+    match geom {
+        None => (0, 0, 0, 0),
+        Some(g) => {
+            let kind = match g.kind {
+                PadKind::Circle => 1,
+                PadKind::Rect => 2,
+                PadKind::RoundRect => 3,
+                PadKind::Oval => 4,
+            };
+            (kind, q(g.w), q(g.h), (g.angle * 100.0).round() as i64)
+        }
+    }
 }
 
 /// Rotate a point clockwise by 90 degrees, `steps` times.
@@ -108,16 +132,25 @@ fn bbox_centre(points: &[(f64, f64)]) -> (f64, f64) {
     ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
 }
 
-/// Rotate a part's local points clockwise by 90*k degrees and build its key.
-fn candidate(part: &Part, local: &[(f64, f64)], k: usize) -> Candidate {
-    // (key entry, original pin index, rotated x, rotated y)
-    let mut entries: Vec<((String, i64, i64, i64), usize, f64, f64)> = local
+/// Rotate a part's local points (and pad shapes) clockwise by 90*k degrees
+/// and build its key. `geoms` are already mirrored for bottom parts.
+fn candidate(part: &Part, local: &[(f64, f64)], geoms: &[Option<PadGeom>], k: usize) -> Candidate {
+    // (key entry, original pin index, rotated x, rotated y, rotated geometry)
+    let mut entries: Vec<(KeyEntry, usize, f64, f64, Option<PadGeom>)> = local
     .iter()
     .enumerate()
     .map(|(i, &(x, y))| {
         let (rx, ry) = rotate_cw(x, y, k);
         let pin = &part.pins[i];
-        ((pin.number.clone(), q(rx), q(ry), q(pin.radius)), i, rx, ry)
+        let geom = geoms[i].map(|g| g.rotated(-90.0 * k as f64));
+        let (gk, gw, gh, ga) = geom_tag(geom);
+        (
+            (pin.number.clone(), q(rx), q(ry), q(pin.radius), gk, gw, gh, ga),
+         i,
+         rx,
+         ry,
+         geom,
+        )
     })
     .collect();
 
@@ -126,11 +159,12 @@ fn candidate(part: &Part, local: &[(f64, f64)], k: usize) -> Candidate {
 
     let pads = entries
     .iter()
-    .map(|(_, i, x, y)| Pad {
+    .map(|(_, i, x, y, geom)| Pad {
         number: part.pins[*i].number.clone(),
          x: *x,
          y: *y,
          radius: part.pins[*i].radius,
+         geom: *geom,
     })
     .collect();
     let pad_pins = entries.iter().map(|e| e.1).collect();
@@ -156,11 +190,17 @@ pub fn build(board: &Board) -> Library {
             continue;
         }
 
-        // 2. Pin positions; bottom parts are mirrored so we see them from the top.
+        // 2. Pin positions and pad shapes; bottom parts are mirrored so we
+        //    see them from the top.
         let points: Vec<(f64, f64)> = part
         .pins
         .iter()
         .map(|p| (if part.bottom { -p.x } else { p.x }, p.y))
+        .collect();
+        let geoms: Vec<Option<PadGeom>> = part
+        .pins
+        .iter()
+        .map(|p| p.pad.map(|g| if part.bottom { g.mirrored_x() } else { g }))
         .collect();
 
         // 3. Move the part so its bounding-box centre is at (0, 0).
@@ -170,9 +210,9 @@ pub fn build(board: &Board) -> Library {
         // 4-5. Try all four rotations and keep the one with the smallest key.
         // Only a strictly smaller key wins, so ties go to the smallest k.
         let mut best_k = 0;
-        let mut best = candidate(part, &local, 0);
+        let mut best = candidate(part, &local, &geoms, 0);
         for k in 1..4 {
-            let cand = candidate(part, &local, k);
+            let cand = candidate(part, &local, &geoms, k);
             if cand.key < best.key {
                 best_k = k;
                 best = cand;
@@ -256,8 +296,27 @@ mod tests {
                  x,
                  y,
                  radius: 5.0,
+                 pad: None,
             })
             .collect(),
+        }
+    }
+
+    /// Like `part`, but every pin gets the given pad shape.
+    fn part_with_pad(refdes: &str, bottom: bool, pins: &[(&str, f64, f64)], pad: PadGeom) -> Part {
+        let mut p = part(refdes, bottom, pins);
+        for pin in p.pins.iter_mut() {
+            pin.pad = Some(pad);
+        }
+        p
+    }
+
+    fn rect(w: f64, h: f64, angle: f64) -> PadGeom {
+        PadGeom {
+            kind: PadKind::Rect,
+            w,
+            h,
+            angle,
         }
     }
 
@@ -295,6 +354,7 @@ mod tests {
         assert_eq!(lib.footprints.len(), 1);
         assert_eq!(lib.footprints[0].count, 2);
         assert_ne!(lib.placements[0].rotation, lib.placements[1].rotation);
+        assert!(lib.footprints[0].pads.iter().all(|p| p.geom.is_none()));
     }
 
     #[test]
@@ -360,6 +420,51 @@ mod tests {
         let lib = build(&b);
         assert_eq!(lib.skipped, vec!["MH1"]);
         assert!(lib.placements.is_empty());
+    }
+
+    #[test]
+    fn rotated_part_with_rect_pads_shares_a_footprint() {
+        // R2 is R1 turned 90 degrees CCW: positions and pad angles both turned.
+        let b = board(vec![
+            part_with_pad("R1", false, &[("1", 0.0, 0.0), ("2", 20.0, 0.0)], rect(10.0, 20.0, 0.0)),
+                      part_with_pad(
+                          "R2",
+                          false,
+                          &[("1", 100.0, 100.0), ("2", 100.0, 120.0)],
+                                    rect(10.0, 20.0, 90.0),
+                      ),
+        ]);
+        let lib = build(&b);
+        assert_eq!(lib.footprints.len(), 1, "{:#?}", lib.footprints);
+        assert_eq!(lib.footprints[0].count, 2);
+        for pad in &lib.footprints[0].pads {
+            assert_eq!(pad.geom, Some(rect(10.0, 20.0, 0.0)));
+        }
+        assert!(max_error(&b, &lib) < 1e-6);
+    }
+
+    #[test]
+    fn different_pad_sizes_make_different_footprints() {
+        let pins = [("1", 0.0, 0.0), ("2", 20.0, 0.0)];
+        let b = board(vec![
+            part_with_pad("R1", false, &pins, rect(10.0, 20.0, 0.0)),
+                      part_with_pad("R2", false, &pins, rect(12.0, 20.0, 0.0)),
+        ]);
+        assert_eq!(build(&b).footprints.len(), 2);
+    }
+
+    #[test]
+    fn mirrored_bottom_pads_share_a_footprint() {
+        let pins = [("1", 0.0, 0.0), ("2", 30.0, 0.0)];
+        // Top-side mirror image: x negated, pad angle 30 -> 150.
+        let top_pins: Vec<(&str, f64, f64)> = pins.iter().map(|&(n, x, y)| (n, -x, y)).collect();
+        let b = board(vec![
+            part_with_pad("Q1", true, &pins, rect(10.0, 20.0, 30.0)),
+                      part_with_pad("Q2", false, &top_pins, rect(10.0, 20.0, 150.0)),
+        ]);
+        let lib = build(&b);
+        assert_eq!(lib.footprints.len(), 1, "{:#?}", lib.footprints);
+        assert_eq!(lib.placements[0].footprint_id, lib.placements[1].footprint_id);
     }
 
     /// Run with: cargo test footprint::tests::real_file -- --ignored --nocapture

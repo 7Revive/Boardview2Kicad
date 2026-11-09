@@ -214,11 +214,12 @@ fn parse_pin_row(
 
     board.parts[part_index].pins.push(Pin {
         number: number.to_string(),
-                                      name: pin_name.to_string(),
-                                      net: get(cols, fields, "NET_NAME").to_string(),
-                                      x: x * unit,
-                                      y: y * unit,
-                                      radius: radius * unit,
+        name: pin_name.to_string(),
+        net: get(cols, fields, "NET_NAME").to_string(),
+        x: x * unit,
+        y: y * unit,
+        radius: radius * unit,
+        pad: None,
     });
 }
 
