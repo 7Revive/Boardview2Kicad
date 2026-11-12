@@ -3,8 +3,8 @@
     use std::path::Path;
 
     use crate::footprint::{Footprint, Library, Placement};
-    use crate::kicad::fp::drill_for;
-    use crate::kicad::sexpr::{atom, list, num, string, SExpr};
+    use crate::kicad::fp::{drill_for, pad_shape as fp_pad_shape};
+    use crate::kicad::sexpr::{atom, deg, list, num, string, SExpr};
     use crate::model::{Board, PadKind, Part, Pin, MIL_TO_MM};
 
     /// Smallest pad size written, in mm.
@@ -33,6 +33,7 @@
     }
 
     /// Turn values that are zero apart from rounding noise into exact zeros.
+    #[cfg(test)]
     fn clean(v: f64) -> f64 {
         if v.abs() < 1e-9 {
             0.0
@@ -43,6 +44,7 @@
 
     /// (sin, cos) of an angle in degrees. Multiples of 90 are exact, so a
     /// 90-degree turn doesn't leave tiny errors like 6e-17.
+    #[cfg(test)]
     fn sin_cos_deg(deg: f64) -> (f64, f64) {
         let d = deg.rem_euclid(360.0);
         if d == 0.0 {
@@ -74,6 +76,9 @@
     /// Position of a pin inside its footprint (lx, ly), in KiCad mm, for a
     /// footprint at (ox, oy) with angle θ. This undoes KiCad's own placement
     /// rotation, so KiCad puts the pad exactly on the original pin.
+    /// Test-only: the writer uses the library pad (see `placed_footprint`);
+    /// tests use this to check the placement maths against the real pins.
+    #[cfg(test)]
     pub(crate) fn pad_local(ox: f64, oy: f64, theta: f64, pin: &Pin) -> (f64, f64) {
         let (px, py) = to_kicad(pin.x, pin.y);
         let (dx, dy) = (px - ox, py - oy);
@@ -200,7 +205,7 @@
              vec![
                  string(name),
              string(value),
-             list("at", vec![num(0.0), num(y), num(theta)]),
+             list("at", vec![num(0.0), num(y), deg(theta)]),
              list("layer", vec![string(layer)]),
              effects(bottom),
              ],
@@ -226,7 +231,7 @@
         let mut items = vec![
             string(&format!("Board:{}", id)),
             list("layer", vec![string(&format!("{}.Cu", side))]),
-            list("at", vec![num(ox), num(oy), num(theta)]),
+            list("at", vec![num(ox), num(oy), deg(theta)]),
             property("Reference", &pl.refdes, -1.0, theta, &format!("{}.SilkS", side), pl.bottom),
             property("Value", &id, 1.0, theta, &format!("{}.Fab", side), pl.bottom),
             list(
@@ -237,14 +242,26 @@
 
         for (pad, &pin_index) in fp.pads.iter().zip(&pl.pad_pins) {
             let pin = &part.pins[pin_index];
-            let (lx, ly) = pad_local(ox, oy, theta, pin);
             let (shape, w, h, angle) = pin_shape(pin, theta);
+            // Write the library pad, not this part's own pin: parts sharing a
+            // footprint can differ by up to 0.1 mil (the dedupe grid) and must
+            // print the same numbers as the .kicad_mod. KiCad flips bottom
+            // footprints, so their local Y is not negated.
+            let lx = pad.x * MIL_TO_MM;
+            let ly = (if pl.bottom { pad.y } else { -pad.y }) * MIL_TO_MM;
+            // Library size, in this pin's orientation (the library copy may have w/h swapped).
+            let (_, fw, fh, _) = fp_pad_shape(pad);
+            let (w, h) = if (w - fw).abs() + (h - fh).abs() <= (w - fh).abs() + (h - fw).abs() {
+                (fw, fh)
+            } else {
+                (fh, fw)
+            };
 
             let mut pad_items = vec![
                 string(&pad.number),
                 atom(if fp.through_hole { "thru_hole" } else { "smd" }),
                 atom(shape),
-                list("at", vec![num(lx), num(ly), num(angle)]),
+                list("at", vec![num(lx), num(ly), deg(angle)]),
                 list("size", vec![num(w), num(h)]),
             ];
             if fp.through_hole {
@@ -548,6 +565,50 @@
             assert!(text.contains("(drill 0.91)"), "text:\n{}", text);
             assert!(text.contains("(layers \"*.Cu\" \"*.Mask\")"), "text:\n{}", text);
             assert!(text.contains("(attr through_hole)"), "text:\n{}", text);
+        }
+
+        #[test]
+        fn parts_sharing_a_footprint_print_identical_pads() {
+            // R2's pins and pad width are 0.04 mil off R1's: same dedupe key
+            // (0.1-mil grid), but on its own R2 would print 0.255 / 0.509.
+            let mut r1 = part("R1", false, &[("1", "", "", 0.0, 0.0), ("2", "", "", 20.0, 0.0)]);
+            let mut r2 = part("R2", false, &[("1", "", "", 100.0, 100.0), ("2", "", "", 120.04, 100.0)]);
+            for p in r1.pins.iter_mut() {
+                p.pad = Some(rect(20.0, 10.0, 0.0));
+            }
+            for p in r2.pins.iter_mut() {
+                p.pad = Some(rect(20.04, 10.0, 0.0));
+            }
+            let board = Board {
+                parts: vec![r1, r2],
+                warnings: Vec::new(),
+            };
+            let lib = build(&board);
+            assert_eq!(lib.footprints.len(), 1);
+            let text = board_sexpr(&board, &lib).to_pretty();
+            assert!(!text.contains("0.255") && !text.contains("0.509"), "text:\n{}", text);
+
+            // The pad (at ...) and (size ...) lines of both footprints are identical.
+            let footprint_starts: Vec<usize> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.trim_start().starts_with("(footprint "))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(footprint_starts.len(), 2);
+            let lines: Vec<&str> = text.lines().map(str::trim).collect();
+            let pad_lines = |from: usize, to: usize| -> Vec<&str> {
+                lines[from..to]
+                    .iter()
+                    .copied()
+                    .skip_while(|l| !l.starts_with("(pad "))
+                    .filter(|l| l.starts_with("(at ") || l.starts_with("(size "))
+                    .collect()
+            };
+            let a = pad_lines(footprint_starts[0], footprint_starts[1]);
+            let b = pad_lines(footprint_starts[1], lines.len());
+            assert_eq!(a.len(), 4, "{:?}", a);
+            assert_eq!(a, b);
         }
 
         /// Run with: cargo test kicad::pcb::tests::real_file -- --ignored --nocapture

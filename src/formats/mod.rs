@@ -67,7 +67,12 @@ pub fn detect(path: &Path, data: &[u8]) -> Result<Format, String> {
 }
 
 /// Detects the format and parses the file into a Board.
-pub fn load(path: &Path, data: &[u8], fz_key: &fz::decrypt::Key) -> Result<(Board, Format), String> {
+pub fn load(
+    path: &Path,
+    data: &[u8],
+    fz_key: &fz::decrypt::Key,
+    mm_per_unit: Option<f64>,
+) -> Result<(Board, Format), String> {
     let format = detect(path, data)?;
     let board = match format {
         Format::Fz => {
@@ -75,7 +80,7 @@ pub fn load(path: &Path, data: &[u8], fz_key: &fz::decrypt::Key) -> Result<(Boar
             fz::parse::parse(&unpacked.content, &unpacked.descr)
         }
         Format::Tvw => tvw::parse(data)?,
-        Format::Gencad => gencad::parse(data)?,
+        Format::Gencad => gencad::parse_with_units(data, mm_per_unit)?,
     };
     Ok((board, format))
 }

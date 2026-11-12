@@ -854,10 +854,111 @@ fn fold_butterfly(board: &mut Board, warnings: &mut Vec<String>) {
 }
 
 // ---------------------------------------------------------------------------
+// 11. BGA pads
+// ---------------------------------------------------------------------------
+
+/// Smallest pin count for the BGA heuristic.
+const BGA_MIN_PINS: usize = 16;
+/// Size tolerance (fraction of the width) for "square" and "same size".
+const BGA_SIZE_TOL: f64 = 0.01;
+/// Above this many converted parts, one summary warning replaces the per-part ones.
+const BGA_MAX_PART_WARNINGS: usize = 20;
+
+/// True for BGA ball names: 1-2 uppercase letters, then digits (A7, AB12).
+fn is_ball_name(s: &str) -> bool {
+    let letters = s.bytes().take_while(|b| b.is_ascii_uppercase()).count();
+    (1..=2).contains(&letters)
+        && s.len() > letters
+        && s.bytes().skip(letters).all(|b| b.is_ascii_digit())
+}
+
+/// The side of the square pads if `part` looks like a BGA, else None.
+fn bga_pad_side(part: &Part) -> Option<f64> {
+    // 1. Enough pins (every pin must have a pad shape, checked below).
+    let n = part.pins.len();
+    if n < BGA_MIN_PINS {
+        return None;
+    }
+
+    // 2. Every pad a square Rect, all the same size, angle a multiple of 90.
+    let first = part.pins[0].pad?;
+    for pin in &part.pins {
+        let g = pin.pad?;
+        let a = g.angle.rem_euclid(90.0);
+        if g.kind != PadKind::Rect
+            || (g.w - g.h).abs() > BGA_SIZE_TOL * g.w
+            || (g.w - first.w).abs() > BGA_SIZE_TOL * first.w
+            || (g.h - first.h).abs() > BGA_SIZE_TOL * first.h
+            || (a > 0.01 && a < 90.0 - 0.01)
+        {
+            return None;
+        }
+    }
+    let side = first.w.max(first.h);
+
+    // 3. A 2D grid: at least 4 distinct x and 4 distinct y (0.1-mil steps).
+    let xs: HashSet<i64> = part.pins.iter().map(|p| (p.x * 10.0).round() as i64).collect();
+    let ys: HashSet<i64> = part.pins.iter().map(|p| (p.y * 10.0).round() as i64).collect();
+    if xs.len() < 4 || ys.len() < 4 {
+        return None;
+    }
+
+    // 4. At least 90 % of the pins have ball names.
+    let named = part.pins.iter().filter(|p| is_ball_name(&p.number)).count();
+    if named * 10 < n * 9 {
+        return None;
+    }
+
+    // 5. Circles of diameter `side` must not overlap: every pitch > side.
+    let side2 = side * side;
+    for (i, a) in part.pins.iter().enumerate() {
+        for b in &part.pins[i + 1..] {
+            if (a.x - b.x).powi(2) + (a.y - b.y).powi(2) <= side2 {
+                return None;
+            }
+        }
+    }
+    Some(side)
+}
+
+/// GenCAD writes every pad as a RECTANGLE, so BGA balls arrive as squares.
+/// Turn the pads of parts that look like BGAs into circles of the same size.
+/// Only the pad shape changes; positions, numbers, names and nets stay.
+fn round_bga_pads(parts: &mut [Part], warnings: &mut Vec<String>) {
+    let mut messages: Vec<String> = Vec::new();
+    let mut total_pads = 0usize;
+    for part in parts.iter_mut() {
+        let Some(side) = bga_pad_side(part) else { continue };
+        for pin in part.pins.iter_mut() {
+            pin.pad = Some(PadGeom::circle(side)); // takes a diameter
+        }
+        total_pads += part.pins.len();
+        messages.push(format!(
+            "{}: {} square pads converted to round (BGA heuristic)",
+            part.refdes,
+            part.pins.len()
+        ));
+    }
+    if messages.len() > BGA_MAX_PART_WARNINGS {
+        warnings.push(format!(
+            "{} parts: {} square pads converted to round (BGA heuristic)",
+            messages.len(),
+            total_pads
+        ));
+    } else {
+        warnings.extend(messages);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parse
 // ---------------------------------------------------------------------------
 
 pub fn parse(data: &[u8]) -> Result<Board, String> {
+    parse_with_units(data, None)
+}
+
+pub fn parse_with_units(data: &[u8], mm_per_unit: Option<f64>) -> Result<Board, String> {
     let text = to_text(data);
     let all = sections(&text);
     if all.is_empty() {
@@ -866,7 +967,10 @@ pub fn parse(data: &[u8]) -> Result<Board, String> {
 
     let mut warnings: Vec<String> = Vec::new();
 
-    let f = units_factor(&all, &mut warnings);
+    let f = match mm_per_unit {
+        Some(mm) => mm / 0.0254,
+        None => units_factor(&all, &mut warnings),
+    };
     let pads = read_pads(&all, f);
     let stacks = read_padstacks(&all, &pads);
     let mut shapes = read_shapes(&all, f);
@@ -966,6 +1070,7 @@ pub fn parse(data: &[u8]) -> Result<Board, String> {
     }
 
     fold_butterfly(&mut board, &mut warnings);
+    round_bga_pads(&mut board.parts, &mut warnings);
 
     if board.parts.is_empty() {
         warnings.push("no parts were produced".to_string());
@@ -1212,6 +1317,170 @@ $COMPONENTS\nCOMPONENT U1\nPLACE 0 0\nSHAPE D\n$ENDCOMPONENTS\n",
         let pin = &board.parts[0].pins[0];
         assert_pad(pin, PadKind::Oval, 10.0, 40.0, 0.0);
         assert!(close(pin.radius, 5.0));
+    }
+    /// No UNITS line; two components on one shape with pins at x = 0 and
+    /// x = 55.28133936 (same y); pad RECTANGLE 63.00627588 x 63.00627588.
+    const NO_UNITS: &str = "$HEADER\nGENCAD 1.4\n$ENDHEADER\n\
+$PADS\nPAD P1 RECTANGULAR 0\nRECTANGLE 0 0 63.00627588 63.00627588\n$ENDPADS\n\
+$PADSTACKS\nPADSTACK PS 0\nPAD P1 TOP 0 0\n$ENDPADSTACKS\n\
+$SHAPES\nSHAPE S\nPIN 1 PS 0 0 TOP 0 0\nPIN 2 PS 55.28133936 0 TOP 0 0\n$ENDSHAPES\n\
+$COMPONENTS\n\
+COMPONENT U1\nPLACE 0 0\nSHAPE S\n\
+COMPONENT U2\nPLACE 1000 500\nSHAPE S\n\
+$ENDCOMPONENTS\n";
+
+        /// Pin 2 x minus pin 1 x, in mils, for one part.
+        fn spacing(part: &Part) -> f64 {
+            let x = |n: &str| part.pins.iter().find(|p| p.number == n).unwrap().x;
+            x("2") - x("1")
+        }
+
+        #[test]
+        fn mm_per_unit_overrides_units() {
+            let board = parse_with_units(NO_UNITS.as_bytes(), Some(0.013567)).unwrap();
+            assert_eq!(board.parts.len(), 2);
+            let mil_075mm = 0.75 / 0.0254; // 29.5276 mil
+            for part in &board.parts {
+                let s = spacing(part);
+                assert!((s - mil_075mm).abs() < 0.05, "spacing {} mil", s);
+                assert!((s * 0.0254 - 0.75).abs() < 0.001, "spacing {} mm", s * 0.0254);
+                let g = part.pins[0].pad.expect("pad shape");
+                let want = 63.00627588 * 0.013567 / 0.0254;
+                assert!(close(g.w, want) && close(g.h, want), "{:?}", g);
+            }
+        }
+
+        #[test]
+        fn mm_per_unit_absent_keeps_default() {
+            let board = parse_with_units(NO_UNITS.as_bytes(), None).unwrap();
+            for part in &board.parts {
+                assert!(close(spacing(part), 55.28133936), "{}", spacing(part));
+            }
+            // Same as plain parse(), including the existing "no UNITS" warning.
+            let plain = parse(NO_UNITS.as_bytes()).unwrap();
+            assert_eq!(board.warnings, plain.warnings);
+            assert!(board.warnings.iter().any(|w| w.contains("no UNITS")), "{:?}", board.warnings);
+        }
+
+        #[test]
+        fn mm_per_unit_0254_equals_default() {
+            let a = parse_with_units(NO_UNITS.as_bytes(), Some(0.0254)).unwrap();
+            let b = parse_with_units(NO_UNITS.as_bytes(), None).unwrap();
+            assert_eq!(a.parts.len(), b.parts.len());
+            for (pa, pb) in a.parts.iter().zip(&b.parts) {
+                assert_eq!(pa.refdes, pb.refdes);
+                for (qa, qb) in pa.pins.iter().zip(&pb.pins) {
+                    assert!(close(qa.x, qb.x) && close(qa.y, qb.y), "{:?} vs {:?}", qa, qb);
+                    assert!(close(qa.radius, qb.radius));
+                    assert_eq!(qa.pad, qb.pad);
+                }
+            }
+        }
+    /// A `cols` x `rows` grid of square Rect pads (side `side`, `pitch` apart),
+    /// pin numbers from `name(col, row)`.
+    fn grid_part(
+        cols: usize,
+        rows: usize,
+        pitch: f64,
+        side: f64,
+        name: impl Fn(usize, usize) -> String,
+    ) -> Part {
+        let mut pins = Vec::new();
+        for r in 0..rows {
+            for c in 0..cols {
+                pins.push(Pin {
+                    number: name(c, r),
+                    name: name(c, r),
+                    net: String::new(),
+                    x: c as f64 * pitch,
+                    y: -(r as f64) * pitch,
+                    radius: side / 2.0,
+                    pad: Some(PadGeom { kind: PadKind::Rect, w: side, h: side, angle: 0.0 }),
+                });
+            }
+        }
+        Part {
+            refdes: "U1".to_string(),
+            insertion_code: "1".to_string(),
+            sym_name: String::new(),
+            bottom: false,
+            rotation: Some(0.0),
+            part_number: None,
+            description: None,
+            pins,
+        }
+    }
+
+    /// Ball name: row letter A, B, ... then column number 1, 2, ...
+    fn ball(c: usize, r: usize) -> String {
+        format!("{}{}", (b'A' + r as u8) as char, c + 1)
+    }
+
+    /// Runs the heuristic on one part; returns the part and the warnings.
+    fn run_bga(part: Part) -> (Part, Vec<String>) {
+        let mut parts = vec![part];
+        let mut warnings = Vec::new();
+        round_bga_pads(&mut parts, &mut warnings);
+        (parts.pop().unwrap(), warnings)
+    }
+
+    fn all_rect(part: &Part) -> bool {
+        part.pins.iter().all(|p| p.pad.map(|g| g.kind) == Some(PadKind::Rect))
+    }
+
+    #[test]
+    fn bga_grid_becomes_round() {
+        let before = grid_part(5, 5, 20.0, 10.0, ball);
+        let (after, warnings) = run_bga(before.clone());
+        for (a, b) in after.pins.iter().zip(&before.pins) {
+            assert_eq!(a.pad, Some(PadGeom::circle(10.0)), "{:?}", a);
+            assert_eq!((a.x, a.y, &a.number, &a.name, &a.net), (b.x, b.y, &b.number, &b.name, &b.net));
+        }
+        assert_eq!(warnings, vec!["U1: 25 square pads converted to round (BGA heuristic)"]);
+    }
+
+    #[test]
+    fn bga_numeric_names_stay_rect() {
+        let (p, w) = run_bga(grid_part(5, 5, 20.0, 10.0, |c, r| (r * 5 + c + 1).to_string()));
+        assert!(all_rect(&p) && w.is_empty());
+    }
+
+    #[test]
+    fn bga_two_rows_stay_rect() {
+        let (p, w) = run_bga(grid_part(8, 2, 20.0, 10.0, ball));
+        assert!(all_rect(&p) && w.is_empty());
+    }
+
+    #[test]
+    fn bga_mixed_pad_sizes_stay_rect() {
+        let mut part = grid_part(5, 5, 20.0, 10.0, ball);
+        part.pins[7].pad = Some(PadGeom { kind: PadKind::Rect, w: 12.0, h: 12.0, angle: 0.0 });
+        let (p, w) = run_bga(part);
+        assert!(all_rect(&p) && w.is_empty());
+    }
+
+    #[test]
+    fn bga_pitch_smaller_than_pad_stays_rect() {
+        let (p, w) = run_bga(grid_part(5, 5, 8.0, 10.0, ball));
+        assert!(all_rect(&p) && w.is_empty());
+    }
+
+    #[test]
+    fn bga_fifteen_pins_stay_rect() {
+        // A 4x4 grid (would pass) minus one pin: still 4 x and 4 y values.
+        let mut part = grid_part(4, 4, 20.0, 10.0, ball);
+        part.pins.pop();
+        let (p, w) = run_bga(part);
+        assert_eq!(p.pins.len(), 15);
+        assert!(all_rect(&p) && w.is_empty());
+    }
+
+    #[test]
+    fn bga_many_parts_give_one_summary_warning() {
+        let mut parts: Vec<Part> = (0..21).map(|_| grid_part(4, 4, 20.0, 10.0, ball)).collect();
+        let mut warnings = Vec::new();
+        round_bga_pads(&mut parts, &mut warnings);
+        assert_eq!(warnings, vec!["21 parts: 336 square pads converted to round (BGA heuristic)"]);
     }
 
     /// Run with: GENCAD_SAMPLE=path/to/file.cad cargo test gencad::tests::real_file -- --ignored --nocapture

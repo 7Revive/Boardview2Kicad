@@ -13,7 +13,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::footprint::{Footprint, Library, Pad};
-use crate::kicad::sexpr::{atom, list, num, string, SExpr};
+use crate::kicad::sexpr::{atom, deg, list, num, string, SExpr};
 use crate::model::{PadKind, MIL_TO_MM};
 
 /// Smallest pad size we write, in mm. Pads with radius 0 still get a visible size.
@@ -36,7 +36,7 @@ fn diameter_mm(pad: &Pad) -> f64 {
 }
 
 /// KiCad shape name, size (w, h) in mm and angle in degrees for one pad.
-fn pad_shape(pad: &Pad) -> (&'static str, f64, f64, f64) {
+pub(crate) fn pad_shape(pad: &Pad) -> (&'static str, f64, f64, f64) {
     match pad.geom {
         None => {
             let d = diameter_mm(pad);
@@ -100,7 +100,7 @@ fn pad_sexpr(pad: &Pad, through_hole: bool) -> SExpr {
     let at = if angle == 0.0 {
         list("at", vec![num(x), num(y)])
     } else {
-        list("at", vec![num(x), num(y), num(angle)])
+        list("at", vec![num(x), num(y), deg(angle)])
     };
 
     let mut children = vec![
@@ -273,8 +273,8 @@ mod tests {
             "(footprint \"1\"",
             "(version 20240108)",
             "(pad \"1\" smd circle",
-            "(at -0.225044 0)",
-            "(size 0.249936 0.249936)",
+            "(at -0.225 0)",
+            "(size 0.25 0.25)",
             "(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")",
         ] {
             assert!(text.contains(expected), "missing {:?} in:\n{}", expected, text);
@@ -288,10 +288,16 @@ mod tests {
     }
 
     #[test]
+    fn pad_position_rounds_to_micrometres() {
+        let text = text_of(vec![pad("1", 55.28133936, 0.0, 4.0)]);
+        assert!(text.contains("(at 1.404 0)"), "text:\n{}", text);
+    }
+
+    #[test]
     fn courtyard_surrounds_pads() {
         let text = two_pad_text();
-        assert!(text.contains("(start -0.600012 -0.374968)"), "text:\n{}", text);
-        assert!(text.contains("(end 0.600012 0.374968)"), "text:\n{}", text);
+        assert!(text.contains("(start -0.6 -0.375)"), "text:\n{}", text);
+        assert!(text.contains("(end 0.6 0.375)"), "text:\n{}", text);
     }
 
     #[test]

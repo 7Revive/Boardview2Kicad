@@ -21,8 +21,10 @@ pub enum SExpr {
     Atom(String),
     /// Printed in double quotes, escaped.
     Str(String),
-    /// Printed with fmt_num.
+    /// A length in mm (or a plain number), printed with fmt_num (rounded to 0.001).
     Num(f64),
+    /// An angle in degrees, printed with fmt_deg (up to 6 decimals, not rounded to 0.001).
+    Deg(f64),
     /// ( ... )
     List(Vec<SExpr>),
 }
@@ -42,6 +44,11 @@ pub fn num(v: f64) -> SExpr {
     SExpr::Num(v)
 }
 
+/// An angle in degrees, e.g. `90`.
+pub fn deg(v: f64) -> SExpr {
+    SExpr::Deg(v)
+}
+
 /// A list whose first element is the keyword `name`, e.g. `(at 1 2)`.
 pub fn list(name: &str, children: Vec<SExpr>) -> SExpr {
     let mut items = Vec::with_capacity(children.len() + 1);
@@ -50,18 +57,24 @@ pub fn list(name: &str, children: Vec<SExpr>) -> SExpr {
     SExpr::List(items)
 }
 
-/// Format a number the way KiCad files usually look:
-/// at most 6 decimals, no trailing zeros, no trailing '.', and never "-0".
+/// Format a length in mm: rounded half away from zero to 0.001 mm, at most
+/// 3 decimals, no trailing zeros or '.', and never "-0".
 pub fn fmt_num(v: f64) -> String {
-    // Round to 6 decimals (Rust's formatter rounds correctly).
-    let mut s = format!("{:.6}", v);
+    let r = (v * 1000.0).round() / 1000.0;
+    // -0.0 (e.g. from -0.0004) equals 0.0: print plain "0".
+    if r == 0.0 {
+        return "0".to_string();
+    }
+    let s = format!("{:.3}", r);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
 
-    // Remove trailing zeros after the decimal point, then a bare '.'.
+/// Format an angle: at most 6 decimals, no trailing zeros, no trailing '.', never "-0".
+pub fn fmt_deg(v: f64) -> String {
+    let mut s = format!("{:.6}", v);
     if s.contains('.') {
         s = s.trim_end_matches('0').trim_end_matches('.').to_string();
     }
-
-    // Tiny negative numbers round to "-0"; print plain "0" instead.
     if s == "-0" {
         s = "0".to_string();
     }
@@ -102,6 +115,7 @@ impl SExpr {
                 out.push('"');
             }
             SExpr::Num(v) => out.push_str(&fmt_num(*v)),
+            SExpr::Deg(v) => out.push_str(&fmt_deg(*v)),
             SExpr::List(children) => {
                 let has_list = children.iter().any(|c| matches!(c, SExpr::List(_)));
 
@@ -183,6 +197,22 @@ mod tests {
     fn inline_list() {
         let e = list("at", vec![num(1.5), num(-2.0), num(90.0)]);
         assert_eq!(e.to_pretty(), "(at 1.5 -2 90)");
+    }
+
+    #[test]
+    fn lengths_round_to_micrometres() {
+        assert_eq!(fmt_num(0.7500004), "0.75");
+        assert_eq!(fmt_num(-0.0004), "0");
+        assert_eq!(fmt_num(1.404149), "1.404");
+        assert_eq!(fmt_num(55.28133936 * 0.0254), "1.404");
+    }
+
+    #[test]
+    fn angles_are_not_rounded_to_micrometres() {
+        assert_eq!(fmt_deg(90.0), "90");
+        assert_eq!(fmt_deg(12.3456789), "12.345679");
+        let e = list("at", vec![num(1.0), num(2.0), deg(90.0)]);
+        assert_eq!(e.to_pretty(), "(at 1 2 90)");
     }
 
     #[test]

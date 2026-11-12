@@ -26,8 +26,9 @@ use std::process::ExitCode;
 use formats::fz::container::{unpack, Unpacked};
 use formats::fz::decrypt::{check_key, load_key, Key};
 
-const USAGE: &str = "usage: board2kicad <input_file> <output_dir> [--key <key_file>] [--dump]\n  \
-supported input: .fz, .tvw";
+const USAGE: &str = "usage: board2kicad <input> <output_dir> [--key file] [--dump] [--mm-per-unit F]\n  \
+supported input: .fz, .tvw, .cad (GenCAD)\n  \
+--mm-per-unit F: GenCAD only; F millimetres per file unit (overrides UNITS)";
 
 /// How many warnings / skipped parts to list before summarising the rest.
 const SHOW_MAX: usize = 10;
@@ -39,6 +40,7 @@ struct Args {
     board: PathBuf,
     out_dir: PathBuf,
     key_file: Option<PathBuf>,
+    mm_per_unit: Option<f64>,
 }
 
 fn main() -> ExitCode {
@@ -74,6 +76,8 @@ fn parse_args(raw: &[OsString]) -> Option<Args> {
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut key_file: Option<PathBuf> = None;
     let mut dump = false;
+    let mut mm_per_unit: Option<f64> = None;
+    let mut iter = raw.iter();
 
     let mut iter = raw.iter();
     while let Some(arg) = iter.next() {
@@ -90,6 +94,22 @@ fn parse_args(raw: &[OsString]) -> Option<Args> {
                 return None;
             }
             dump = true;
+        } else if text == "--mm-per-unit" {
+            // --mm-per-unit only once, followed by a positive number.
+            if mm_per_unit.is_some() {
+                return None;
+            }
+            let value = iter.next().and_then(|v| v.to_str()).unwrap_or("");
+            match value.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() && v > 0.0 => mm_per_unit = Some(v),
+                _ => {
+                    eprintln!(
+                        "error: --mm-per-unit needs a positive number (mm per file unit), got {:?}",
+                              value
+                    );
+                    return None;
+                }
+            }
         } else if text.starts_with("--") {
             return None; // unknown option
         } else {
@@ -109,6 +129,7 @@ fn parse_args(raw: &[OsString]) -> Option<Args> {
          board,
          out_dir,
          key_file,
+         mm_per_unit,
     })
 }
 
@@ -146,7 +167,7 @@ fn run_convert(args: &Args) -> Result<(), String> {
     // Step 1: read the file, detect its format, and turn it into parts and pins.
     let key = choose_key(args.key_file.as_deref())?;
     let data = read_board(&args.board)?;
-    let (board, format) = formats::load(&args.board, &data, &key)?;
+    let (board, format) = formats::load(&args.board, &data, &key, args.mm_per_unit)?;
 
     // Step 2: what we found, and any problems while reading it.
     println!("format: {}", format.name());
